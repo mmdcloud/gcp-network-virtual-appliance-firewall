@@ -9,9 +9,182 @@ data "google_compute_image" "ubuntu_2404" {
 }
 
 # --------------------------------------------------------------------------
-# VPC Configuration
+# Workload Configuration
 # --------------------------------------------------------------------------
-module "producer_vpc" {
+module "workload_vpc" {
+  source                          = "./modules/vpc"
+  vpc_name                        = var.workload_vpc_name
+  delete_default_routes_on_create = false
+  auto_create_subnetworks         = false
+  routing_mode                    = "REGIONAL"
+  subnets = [
+    {
+      name                     = var.workload_subnet_name
+      region                   = var.region
+      purpose                  = "PRIVATE"
+      role                     = "ACTIVE"
+      private_ip_google_access = true
+      ip_cidr_range            = var.workload_subnet_cidr
+    },
+    {
+      name                     = var.workload_lb_subnet_name
+      region                   = var.region
+      purpose                  = "PRIVATE"
+      role                     = "ACTIVE"
+      private_ip_google_access = true
+      ip_cidr_range            = var.workload_lb_subnet_cidr
+    }
+  ]
+  firewall_data = [
+    # {
+    #   name        = "workload-vpc-firewall-http"
+    #   target_tags = [var.producer_instance_tag]
+    #   source_ranges = concat(
+    #     [var.proxy_only_subnet_cidr],  # proxy-only subnet (Envoy -> backend)
+    #     var.health_check_source_ranges # GCP health check probe ranges
+    #   )
+    #   allow_list = [
+    #     {
+    #       protocol = "tcp"
+    #       ports    = [var.http_port]
+    #     }
+    #   ]
+    # },
+    # {
+    #   name          = "workload-vpc-firewall-ssh"
+    #   target_tags   = [var.producer_instance_tag]
+    #   source_ranges = var.iap_ssh_source_ranges
+    #   allow_list = [
+    #     {
+    #       protocol = "tcp"
+    #       ports    = [var.ssh_port]
+    #     }
+    #   ]
+    # }
+  ]
+}
+
+module "workload_cloud_nat" {
+  source = "./modules/cloud-nat"
+
+  project_id = var.project_id
+  region     = var.region
+
+  create_router = true
+  router        = var.workload_router_name
+  network       = module.workload_vpc.self_link
+  type          = "PUBLIC"
+  name          = var.workload_router_nat_name
+
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  subnetworks = [
+    {
+      name                     = module.workload_vpc.subnets_by_name[var.workload_subnet_name].self_link
+      source_ip_ranges_to_nat  = ["ALL_IP_RANGES"]
+      secondary_ip_range_names = []
+    }
+  ]
+
+  log_config_enable = true
+  log_config_filter = "ALL"
+}
+
+module "workload_instance_template" {
+  source = "./modules/instance-template"
+
+  region     = var.region
+  project_id = data.google_project.project.project_id
+
+  name_prefix       = var.workload_instance_template_name_prefix
+  machine_type      = var.workload_instance_template_machine_type
+  source_image      = data.google_compute_image.ubuntu_2404.self_link
+  boot_disk_size_gb = var.workload_boot_disk_size_gb
+  boot_disk_type    = var.workload_boot_disk_type
+
+  network          = module.workload_vpc.self_link
+  subnetwork       = module.workload_vpc.subnets_by_name[var.workload_subnet_name].self_link
+  assign_public_ip = false
+  network_tags     = [var.producer_instance_tag]
+
+  create_service_account = true
+  service_account_roles  = var.service_account_roles
+
+  startup_script = var.startup_script
+
+  labels = var.common_labels
+}
+
+module "workload_mig" {
+  source = "./modules/mig"
+
+  project_id = var.project_id
+  name       = var.workload_mig_name
+  region     = var.region
+
+  instance_template = module.workload_instance_template.self_link_unique
+
+  named_ports = [
+    { name = var.workload_mig_named_port_name, port = var.workload_mig_named_port_number }
+  ]
+
+  health_check = {
+    type         = var.workload_mig_health_check_type
+    port         = var.workload_mig_health_check_port
+    request_path = var.workload_mig_health_check_request_path
+  }
+
+  autoscaling_enabled = true
+  autoscaler_name     = "mig-autoscaler"
+  min_replicas        = var.workload_mig_autoscaling_min_replicas
+  max_replicas        = var.workload_mig_autoscaling_max_replicas
+
+  labels = var.common_labels
+}
+
+module "workload_lb" {
+  source             = "./modules/load-balancer"
+  project_id         = var.project_id
+  name               = var.workload_lb_name
+  load_balancer_type = var.workload_lb_type
+  region             = var.region
+  network            = module.workload_vpc.self_link
+  subnetwork         = module.workload_vpc.subnets_by_name[var.workload_lb_subnet_name].self_link
+
+  create_proxy_only_subnet = true
+  proxy_only_subnet_cidr   = var.workload_proxy_only_subnet_cidr
+
+  backends = {
+    lb = {
+      is_default          = true
+      protocol            = var.workload_lb_backend_protocol
+      port_name           = var.workload_lb_backend_port_name
+      health_check_id     = module.workload_mig.health_check_id
+      manage_health_check = false
+      groups = [
+        {
+          group           = module.workload_mig.instance_group_self_link
+          balancing_mode  = var.workload_lb_balancing_mode
+          capacity_scaler = var.workload_lb_capacity_scaler
+          max_utilization = var.workload_lb_max_utilization
+        }
+      ]
+    }
+  }
+
+  allow_global_access     = var.workload_lb_allow_global_access
+  enable_ssl              = var.workload_lb_enable_ssl
+  enable_http             = var.workload_lb_enable_http
+  managed_ssl_certificate = var.workload_lb_managed_ssl_certificate
+  enable_cloud_armor      = var.workload_lb_enable_cloud_armor
+  depends_on              = [module.workload_mig]
+}
+
+
+# --------------------------------------------------------------------------
+# NVA Configuration
+# --------------------------------------------------------------------------
+module "hub_vpc" {
   source                          = "./modules/vpc"
   vpc_name                        = var.producer_vpc_name
   delete_default_routes_on_create = false
@@ -64,26 +237,23 @@ module "producer_vpc" {
   ]
 }
 
-# --------------------------------------------------------------------------
-# NAT Gateway and Cloud Router Configuration
-# --------------------------------------------------------------------------
-module "cloud_nat" {
+module "nva_cloud_nat" {
   source = "./modules/cloud-nat"
 
   project_id = var.project_id
-  region     = var.producer_region
+  region     = var.region
 
   create_router = true
-  router        = var.router_name
-  network       = module.producer_vpc.self_link
+  router        = var.nva_router_name
+  network       = module.hub_vpc.self_link
   type          = "PUBLIC"
-  name          = var.router_nat_name
+  name          = var.nva_router_nat_name
 
   source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
 
   subnetworks = [
     {
-      name                     = module.producer_vpc.subnets_by_name[var.mig_subnet_name].self_link
+      name                     = module.hub_vpc.subnets_by_name[var.nva_mig_subnet_name].self_link
       source_ip_ranges_to_nat  = ["ALL_IP_RANGES"]
       secondary_ip_range_names = []
     }
@@ -93,23 +263,20 @@ module "cloud_nat" {
   log_config_filter = "ALL"
 }
 
-# -----------------------------------------------------------------------------------------
-# Instance template
-# -----------------------------------------------------------------------------------------
-module "instance_template" {
+module "nva_instance_template" {
   source = "./modules/instance-template"
 
-  region     = var.producer_region
+  region     = var.region
   project_id = data.google_project.project.project_id
 
-  name_prefix       = var.instance_template_name_prefix
-  machine_type      = var.instance_template_machine_type
+  name_prefix       = var.nva_instance_template_name_prefix
+  machine_type      = var.nva_instance_template_machine_type
   source_image      = data.google_compute_image.ubuntu_2404.self_link
-  boot_disk_size_gb = var.boot_disk_size_gb
-  boot_disk_type    = var.boot_disk_type
+  boot_disk_size_gb = var.nva_boot_disk_size_gb
+  boot_disk_type    = var.nva_boot_disk_type
 
-  network          = module.producer_vpc.self_link
-  subnetwork       = module.producer_vpc.subnets_by_name[var.mig_subnet_name].self_link
+  network          = module.hub_vpc.self_link
+  subnetwork       = module.hub_vpc.subnets_by_name[var.nva_mig_subnet_name].self_link
   assign_public_ip = false
   network_tags     = [var.producer_instance_tag]
 
@@ -121,75 +288,69 @@ module "instance_template" {
   labels = var.common_labels
 }
 
-# -----------------------------------------------------------------------------------------
-# MIG Configuration
-# -----------------------------------------------------------------------------------------
-module "mig" {
+module "nva_mig" {
   source = "./modules/mig"
 
   project_id = var.project_id
-  name       = var.mig_name
-  region     = var.producer_region
+  name       = var.nva_mig_name
+  region     = var.region
 
-  instance_template = module.instance_template.self_link_unique
+  instance_template = module.nva_instance_template.self_link_unique
 
   named_ports = [
-    { name = var.mig_named_port_name, port = var.mig_named_port_number }
+    { name = var.nva_mig_named_port_name, port = var.nva_mig_named_port_number }
   ]
 
   health_check = {
-    type         = var.mig_health_check_type
-    port         = var.mig_health_check_port
-    request_path = var.mig_health_check_request_path
+    type         = var.nva_mig_health_check_type
+    port         = var.nva_mig_health_check_port
+    request_path = var.nva_mig_health_check_request_path
   }
 
   autoscaling_enabled = true
   autoscaler_name     = "mig-autoscaler"
-  min_replicas        = var.mig_autoscaling_min_replicas
-  max_replicas        = var.mig_autoscaling_max_replicas
+  min_replicas        = var.nva_mig_autoscaling_min_replicas
+  max_replicas        = var.nva_mig_autoscaling_max_replicas
 
   labels = var.common_labels
 }
 
-# -----------------------------------------------------------------------------------------
-# Load Balancer
-# -----------------------------------------------------------------------------------------
-module "lb" {
+module "nva_lb" {
   source             = "./modules/load-balancer"
   project_id         = var.project_id
-  name               = var.lb_name
-  load_balancer_type = var.lb_type
-  region             = var.producer_region
-  network            = module.producer_vpc.self_link
-  subnetwork         = module.producer_vpc.subnets_by_name[var.lb_subnet_name].self_link
+  name               = var.nva_lb_name
+  load_balancer_type = var.nva_lb_type
+  region             = var.region
+  network            = module.hub_vpc.self_link
+  subnetwork         = module.hub_vpc.subnets_by_name[var.nva_lb_subnet_name].self_link
 
   create_proxy_only_subnet = true
-  proxy_only_subnet_cidr   = var.proxy_only_subnet_cidr
+  proxy_only_subnet_cidr   = var.nva_proxy_only_subnet_cidr
 
   backends = {
     lb = {
       is_default          = true
-      protocol            = var.lb_backend_protocol
-      port_name           = var.lb_backend_port_name
-      health_check_id     = module.mig.health_check_id
+      protocol            = var.nva_lb_backend_protocol
+      port_name           = var.nva_lb_backend_port_name
+      health_check_id     = module.nva_mig.health_check_id
       manage_health_check = false
       groups = [
         {
-          group           = module.mig.instance_group_self_link
-          balancing_mode  = var.lb_balancing_mode
-          capacity_scaler = var.lb_capacity_scaler
-          max_utilization = var.lb_max_utilization
+          group           = module.nva_mig.instance_group_self_link
+          balancing_mode  = var.nva_lb_balancing_mode
+          capacity_scaler = var.nva_lb_capacity_scaler
+          max_utilization = var.nva_lb_max_utilization
         }
       ]
     }
   }
 
-  allow_global_access     = var.lb_allow_global_access
-  enable_ssl              = var.lb_enable_ssl
-  enable_http             = var.lb_enable_http
-  managed_ssl_certificate = var.lb_managed_ssl_certificate
-  enable_cloud_armor      = var.lb_enable_cloud_armor
-  depends_on              = [module.mig]
+  allow_global_access     = var.nva_lb_allow_global_access
+  enable_ssl              = var.nva_lb_enable_ssl
+  enable_http             = var.nva_lb_enable_http
+  managed_ssl_certificate = var.nva_lb_managed_ssl_certificate
+  enable_cloud_armor      = var.nva_lb_enable_cloud_armor
+  depends_on              = [module.nva_mig]
 }
 
 #---------------------------------------------------------------
